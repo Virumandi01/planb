@@ -53,3 +53,31 @@ func Init() error {
 
 	return nil
 }
+
+// LoadConfig safely opens and parses the main data matrix file
+func LoadConfig() (PlanBConfig, error) {
+	var cfg PlanBConfig
+	path, err := GetConfigPath()
+	if err != nil {
+		return cfg, err
+	}
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	err = json.Unmarshal(bytes, &cfg)
+	return cfg, err
+}
+
+// SaveConfig commits the memory config variables to physical state storage
+func SaveConfig(cfg PlanBConfig) error {
+	path, err := GetConfigPath()
+	if err != nil {
+		return err
+	}
+	bytes, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, bytes, 0644)
+}

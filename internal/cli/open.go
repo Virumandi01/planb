@@ -9,23 +9,24 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// openCmd represents the "open" command
 var openCmd = &cobra.Command{
 	Use:   "open",
 	Short: "Open the interactive Plan-B Dashboard",
 	Run: func(cmd *cobra.Command, args []string) {
-		// Initialize the Bubbletea program
-		p := tea.NewProgram(ui.InitialModel(), tea.WithAltScreen()) // AltScreen clears the terminal beautifully
+		// Pass tea.WithAltScreen() to completely clear the screen and take over the terminal window
+		p := tea.NewProgram(
+			ui.InitialModel(),
+			tea.WithAltScreen(),       // Takes over the entire window
+			tea.WithMouseCellMotion(), // Prepares it for mouse interactions later
+		)
 
-		// Run the UI. When the user presses 'q', it closes and returns here.
 		if _, err := p.Run(); err != nil {
-			fmt.Printf("Alas, there's been an error: %v", err)
+			fmt.Printf("Alas, there's been an error: %v\n", err)
 			os.Exit(1)
 		}
 	},
 }
 
 func init() {
-	// Add the "open" command to our root "planb" command
 	rootCmd.AddCommand(openCmd)
 }
