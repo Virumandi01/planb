@@ -80,7 +80,7 @@ func InitialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, tick())
+	return tea.Batch(tea.ClearScreen, textinput.Blink, tick())
 }
 
 // addLog appends a line to the terminal history and keeps only the last 4 lines
@@ -95,6 +95,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		return m, tea.ClearScreen
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
