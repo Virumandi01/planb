@@ -18,9 +18,15 @@ import (
 )
 
 var (
+	// Default border style
 	baseStyle = lipgloss.NewStyle().
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("240"))
+
+	// High-contrast border style for the focused panel
+	focusedStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("69")) // Planet VE Active Blue
 
 	titleStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -33,14 +39,13 @@ var (
 	promptStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	echoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245")) // Dimmer color for your echoed commands
+	echoStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
-// logLine represents a single line in the embedded terminal history
 type logLine struct {
 	text  string
 	isErr bool
-	isCmd bool // True if it's the command you typed, false if it's a system response
+	isCmd bool
 }
 
 type model struct {
@@ -49,7 +54,12 @@ type model struct {
 	instances map[string]config.Instance
 
 	input   textinput.Model
-	history []logLine // Stores the terminal history
+	history []logLine
+
+	// New Navigation States
+	focusedPanel string // "terminal" or "table"
+	cursor       int    // Which row is highlighted in the table
+	scrollOffset int    // Viewport window tracking pointer
 }
 
 type tickMsg time.Time
@@ -62,11 +72,10 @@ func InitialModel() model {
 	cpu, ram := monitor.GetSystemStats()
 	cfg, _ := config.LoadConfig()
 
-	// --- NEW FEATURE: GLOBAL RADAR BOOT SEQUENCE ---
+	// Global Radar Boot Sequence
 	discovered := monitor.ScanGlobalNetwork()
 	needsSave := false
 
-	// Count our current OP and LH ids to assign new numbers sequentially
 	opCount, lhCount := 0, 0
 	for k := range cfg.Instances {
 		if strings.HasPrefix(k, "OP") {
@@ -77,7 +86,6 @@ func InitialModel() model {
 		}
 	}
 
-	// Map discovered processes into our database if they don't already exist
 	for _, app := range discovered {
 		alreadyTracked := false
 		for _, inst := range cfg.Instances {
@@ -115,10 +123,9 @@ func InitialModel() model {
 	if needsSave {
 		_ = config.SaveConfig(cfg)
 	}
-	// --- END RADAR SEQUENCE ---
 
 	ti := textinput.New()
-	ti.Placeholder = "Type 'nchange OP01 NewName', 'logs LH01', 'clear'..."
+	ti.Placeholder = "Type command... (Press 'Tab' to switch focus to table navigation)"
 	ti.Prompt = "PLAN-B > "
 	ti.PromptStyle = promptStyle
 	ti.Focus()
@@ -126,11 +133,14 @@ func InitialModel() model {
 	ti.Width = 80
 
 	return model{
-		cpuLoad:   cpu,
-		ramUsed:   ram,
-		instances: cfg.Instances,
-		input:     ti,
-		history:   []logLine{{text: "System Boot: Global Radar Scan Complete.", isErr: false, isCmd: false}},
+		cpuLoad:      cpu,
+		ramUsed:      ram,
+		instances:    cfg.Instances,
+		input:        ti,
+		history:      []logLine{{text: "System Boot: Global Radar Scan Complete.", isErr: false, isCmd: false}},
+		focusedPanel: "terminal", // Boot directly focused into the terminal prompt
+		cursor:       0,
+		scrollOffset: 0,
 	}
 }
 
@@ -138,16 +148,18 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(tea.ClearScreen, textinput.Blink, tick())
 }
 
-// addLog appends a line to the terminal history and keeps only the last 4 lines
 func (m *model) addLog(text string, isErr bool, isCmd bool) {
 	m.history = append(m.history, logLine{text: text, isErr: isErr, isCmd: isCmd})
 	if len(m.history) > 4 {
-		m.history = m.history[len(m.history)-4:] // Drop the oldest line
+		m.history = m.history[len(m.history)-4:]
 	}
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
+
+	// Get total instances count for boundary protection
+	totalInstances := len(m.instances)
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -156,38 +168,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
+
+		case tea.KeyTab:
+			// Toggle focus between the panel views seamlessly
+			if m.focusedPanel == "terminal" {
+				m.focusedPanel = "table"
+				m.input.Blur() // Turn off blinking text cursor
+			} else {
+				m.focusedPanel = "terminal"
+				m.input.Focus() // Turn on blinking text cursor
+			}
+			return m, nil
+
 		case tea.KeyEnter:
-			val := m.input.Value()
-			m.input.SetValue("")
-			m.processCommand(val)
+			if m.focusedPanel == "terminal" {
+				val := m.input.Value()
+				m.input.SetValue("")
+				m.processCommand(val)
+			}
+			return m, nil
+		}
+
+		// Handle specific navigation keystrokes if the table panel has active focus
+		if m.focusedPanel == "table" && totalInstances > 0 {
+			switch msg.String() {
+			case "up", "k":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down", "j":
+				if m.cursor < totalInstances-1 {
+					m.cursor++
+				}
+			}
 			return m, nil
 		}
 
 	case tickMsg:
-		// 1. Refresh System Stats
 		m.cpuLoad, m.ramUsed = monitor.GetSystemStats()
-
-		// 2. Refresh Database
 		cfg, _ := config.LoadConfig()
+		m.instances = cfg.Instances
 
-		// 3. AUTO-PORT SCANNER LOGIC
+		// Keep auto-port scanner logic active in background thread
 		needsSave := false
 		for k, inst := range cfg.Instances {
-			// If it's LIVE but we don't know the port yet...
 			if inst.Status == "LIVE" && inst.TargetPort == 0 {
 				detectedPort := monitor.DetectPort(inst.LastPID)
 				if detectedPort > 0 {
-					// We found the port! Update the struct and save it forever.
 					inst.TargetPort = detectedPort
 					cfg.Instances[k] = inst
 					needsSave = true
-
-					// Announce it in the embedded terminal
 					m.addLog(fmt.Sprintf("System detected %s bound to Port %d", k, detectedPort), false, false)
 				}
 			}
 		}
-
 		if needsSave {
 			_ = config.SaveConfig(cfg)
 		}
@@ -196,7 +230,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tick()
 	}
 
-	m.input, cmd = m.input.Update(msg)
+	if m.focusedPanel == "terminal" {
+		m.input, cmd = m.input.Update(msg)
+	}
 	return m, cmd
 }
 
@@ -206,18 +242,15 @@ func (m *model) processCommand(inputStr string) {
 		return
 	}
 
-	// Echo the command you just typed into the history
 	m.addLog(inputStr, false, true)
-
 	parts := strings.SplitN(inputStr, " ", 3)
 	action := strings.ToLower(parts[0])
 
 	switch action {
 	case "clear":
-		m.history = []logLine{} // Instantly wipe the terminal history
+		m.history = []logLine{}
 		return
 
-	// --- NEW FEATURE: NCHANGE COMMAND ---
 	case "nchange":
 		if len(parts) < 3 {
 			m.addLog("Usage: nchange [ID] [NewName]", true, false)
@@ -236,8 +269,26 @@ func (m *model) processCommand(inputStr string) {
 		inst.Name = newName
 		cfg.Instances[targetID] = inst
 		_ = config.SaveConfig(cfg)
-
 		m.addLog(fmt.Sprintf("Successfully renamed %s to '%s'", targetID, newName), false, false)
+
+	case "info":
+		if len(parts) < 2 {
+			m.addLog("Usage: info [ID]", true, false)
+			return
+		}
+		targetID := strings.ToUpper(parts[1])
+		cfg, _ := config.LoadConfig()
+		inst, exists := cfg.Instances[targetID]
+
+		if !exists {
+			m.addLog(fmt.Sprintf("Error: No instance found with ID '%s'", targetID), true, false)
+			return
+		}
+
+		m.addLog(fmt.Sprintf("--- INFO: %s (%s) ---", targetID, inst.Name), false, false)
+		m.addLog(fmt.Sprintf("State: %s | Port: %d | PID: %d", inst.Status, inst.TargetPort, inst.LastPID), false, false)
+		m.addLog(fmt.Sprintf("Path: %s", inst.Path), false, false)
+		m.addLog(fmt.Sprintf("Cmd:  %s", inst.StartCommand), false, false)
 
 	case "logs":
 		if len(parts) < 2 {
@@ -245,7 +296,6 @@ func (m *model) processCommand(inputStr string) {
 			return
 		}
 		targetID := strings.ToUpper(parts[1])
-
 		homeDir, _ := os.UserHomeDir()
 		logPath := filepath.Join(homeDir, ".planb", "logs", fmt.Sprintf("%s_stdout.log", targetID))
 
@@ -255,10 +305,7 @@ func (m *model) processCommand(inputStr string) {
 			return
 		}
 
-		// Grab the last few lines so it doesn't flood the embedded terminal
 		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-
-		// Print up to the last 3 lines of the log
 		startIdx := len(lines) - 3
 		if startIdx < 0 {
 			startIdx = 0
@@ -284,8 +331,10 @@ func (m *model) processCommand(inputStr string) {
 			m.addLog(fmt.Sprintf("Error: No instance found with ID '%s'", targetID), true, false)
 			return
 		}
-		if inst.Status == "STOP" {
-			m.addLog(fmt.Sprintf("Instance '%s' is already stopped.", targetID), false, false)
+
+		// --- SYSTEM SAFETY LOCK ---
+		if inst.StartCommand == "External Process" && !strings.HasPrefix(inst.Path, "/Users/") {
+			m.addLog(fmt.Sprintf("SAFETY LOCK: '%s' is an OS-level process. Access Denied.", targetID), true, false)
 			return
 		}
 
@@ -293,7 +342,6 @@ func (m *model) processCommand(inputStr string) {
 		inst.Status = "STOP"
 		cfg.Instances[targetID] = inst
 		_ = config.SaveConfig(cfg)
-
 		m.addLog(fmt.Sprintf("Successfully stopped %s.", targetID), false, false)
 
 	case "start":
@@ -331,7 +379,6 @@ func (m *model) processCommand(inputStr string) {
 			LastPID:      pid,
 		}
 		_ = config.SaveConfig(cfg)
-
 		m.addLog(fmt.Sprintf("Started %s [%s] on PID: %d", name, nextID, pid), false, false)
 
 	default:
@@ -356,43 +403,62 @@ func (m model) View() string {
 	)
 	systemBox := baseStyle.Render(systemState)
 
-	tableHeader := textStyle.Bold(true).Render(
-		fmt.Sprintf("%-6s | %-18s | %-8s | %-6s | %-8s | %-30s", "ID", "Name", "State", "Port", "Runtime", "Deployment Path"),
-	)
+	// --- SMART SORTING: DEV APPS TOP, SYSTEM APPS BOTTOM ---
+	var devKeys []string
+	var systemKeys []string
+
+	for k, inst := range m.instances {
+		// If it's an external process AND not in your user folder, it's a System app
+		isSystem := inst.StartCommand == "External Process" && !strings.HasPrefix(inst.Path, "/Users/")
+
+		if isSystem {
+			systemKeys = append(systemKeys, k)
+		} else {
+			devKeys = append(devKeys, k)
+		}
+	}
+	sort.Strings(devKeys)
+	sort.Strings(systemKeys)
+	allKeys := append(devKeys, systemKeys...)
+
+	// --- FIXED VIEWPORT SLICING LOGIC (MAX 6 ROWS SHOWN) ---
+	maxRowsShown := 6
+	totalRows := len(allKeys)
+
+	// Automatically adjust scrolling frame offsets based on cursor position
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	} else if m.cursor >= m.scrollOffset+maxRowsShown {
+		m.scrollOffset = m.cursor - maxRowsShown + 1
+	}
 
 	var rows []string
-	if len(m.instances) == 0 {
-		rows = append(rows, textStyle.Render("No instances registered. Use the terminal below to start one."))
+	if totalRows == 0 {
+		rows = append(rows, textStyle.Render("No instances tracked inside system registry."))
 	} else {
-		// --- NEW FEATURE: SORTING OP FIRST, THEN LH ---
-		var opKeys []string
-		var lhKeys []string
-		for k := range m.instances {
-			if strings.HasPrefix(k, "OP") {
-				opKeys = append(opKeys, k)
-			} else {
-				lhKeys = append(lhKeys, k)
-			}
+		endIdx := m.scrollOffset + maxRowsShown
+		if endIdx > totalRows {
+			endIdx = totalRows
 		}
-		sort.Strings(opKeys)
-		sort.Strings(lhKeys)
-		allKeys := append(opKeys, lhKeys...)
 
-		for _, id := range allKeys {
+		for i := m.scrollOffset; i < endIdx; i++ {
+			id := allKeys[i]
 			inst := m.instances[id]
+
 			stateStr := fmt.Sprintf("[%s]", inst.Status)
 			portStr := fmt.Sprintf("%d", inst.TargetPort)
 			if inst.TargetPort == 0 {
 				portStr = "N/A"
 			}
+
 			path := inst.Path
 			if len(path) > 28 {
 				path = "..." + path[len(path)-25:]
 			}
+
 			runtime := "Custom"
 			cmdLower := strings.ToLower(inst.StartCommand)
 			nameLower := strings.ToLower(inst.Name)
-
 			if strings.Contains(cmdLower, "python") || strings.Contains(nameLower, "python") {
 				runtime = "Python"
 			} else if strings.Contains(cmdLower, "node") || strings.Contains(nameLower, "node") {
@@ -401,25 +467,41 @@ func (m model) View() string {
 				runtime = "System"
 			}
 
-			row := textStyle.Render(fmt.Sprintf("%-6s | %-18s | %-8s | %-6s | %-8s | %-30s",
-				id, inst.Name, stateStr, portStr, runtime, path))
-			rows = append(rows, row)
+			rowText := fmt.Sprintf("%-6s | %-18s | %-8s | %-6s | %-8s | %-30s", id, inst.Name, stateStr, portStr, runtime, path)
+
+			// Highlight the row if the table panel has active focus and this row matches the cursor pointer
+			if m.focusedPanel == "table" && i == m.cursor {
+				rows = append(rows, lipgloss.NewStyle().Background(lipgloss.Color("238")).Foreground(lipgloss.Color("255")).Bold(true).Render("➔ "+rowText[2:]))
+			} else {
+				rows = append(rows, textStyle.Render("  "+rowText[2:]))
+			}
 		}
 	}
 
-	tableArea := textStyle.Render("[INSTANCE REPOSITORY]\n" + tableHeader + "\n" + strings.Repeat("-", 85) + "\n" + strings.Join(rows, "\n"))
-	tableBox := baseStyle.Render(tableArea)
+	tableHeader := textStyle.Bold(true).Render(
+		fmt.Sprintf("   %-6s | %-18s | %-8s | %-6s | %-8s | %-30s", "ID", "Name", "State", "Port", "Runtime", "Deployment Path"),
+	)
+
+	tableTitle := "[INSTANCE REPOSITORY]"
+	if m.focusedPanel == "table" {
+		tableTitle = "[INSTANCE REPOSITORY] ● ACTIVE NAVIGATION MODE (Use Up/Down Arrows)"
+	}
+	tableArea := textStyle.Render(tableTitle + "\n" + tableHeader + "\n" + strings.Repeat("-", 88) + "\n" + strings.Join(rows, "\n"))
+
+	// Dynamic border rendering for the table
+	var finalTableBox string
+	if m.focusedPanel == "table" {
+		finalTableBox = focusedStyle.Render(tableArea)
+	} else {
+		finalTableBox = baseStyle.Render(tableArea)
+	}
 
 	// Build the Fixed-Height Embedded Terminal History
 	historyLines := ""
-
-	// Pad with empty lines if we have fewer than 4 items in history
 	emptyLinesNeeded := 4 - len(m.history)
 	for i := 0; i < emptyLinesNeeded; i++ {
 		historyLines += "\n"
 	}
-
-	// Render the actual history
 	for _, msg := range m.history {
 		if msg.isCmd {
 			historyLines += echoStyle.Render("PLAN-B > "+msg.text) + "\n"
@@ -430,10 +512,22 @@ func (m model) View() string {
 		}
 	}
 
-	inputArea := baseStyle.Render("[EMBEDDED TERMINAL]\n" + historyLines + m.input.View())
+	terminalTitle := "[EMBEDDED TERMINAL]"
+	if m.focusedPanel == "terminal" {
+		terminalTitle = "[EMBEDDED TERMINAL] ● ACTIVE INPUT MODE"
+	}
+	inputArea := terminalTitle + "\n" + historyLines + m.input.View()
 
-	footer := textStyle.Render("Press 'Esc' or 'Ctrl+C' to exit back to OS terminal.")
+	// Dynamic border rendering for the terminal
+	var finalInputBox string
+	if m.focusedPanel == "terminal" {
+		finalInputBox = focusedStyle.Render(inputArea)
+	} else {
+		finalInputBox = baseStyle.Render(inputArea)
+	}
+
+	footer := textStyle.Render("Controls: [Tab] Switch Panels | [Esc/Ctrl+C] Exit back to OS terminal.")
 	footerBox := baseStyle.Render(footer)
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, systemBox, tableBox, inputArea, footerBox)
+	return lipgloss.JoinVertical(lipgloss.Left, header, systemBox, finalTableBox, finalInputBox, footerBox)
 }
