@@ -62,8 +62,63 @@ func InitialModel() model {
 	cpu, ram := monitor.GetSystemStats()
 	cfg, _ := config.LoadConfig()
 
+	// --- NEW FEATURE: GLOBAL RADAR BOOT SEQUENCE ---
+	discovered := monitor.ScanGlobalNetwork()
+	needsSave := false
+
+	// Count our current OP and LH ids to assign new numbers sequentially
+	opCount, lhCount := 0, 0
+	for k := range cfg.Instances {
+		if strings.HasPrefix(k, "OP") {
+			opCount++
+		}
+		if strings.HasPrefix(k, "LH") {
+			lhCount++
+		}
+	}
+
+	// Map discovered processes into our database if they don't already exist
+	for _, app := range discovered {
+		alreadyTracked := false
+		for _, inst := range cfg.Instances {
+			if inst.LastPID == app.PID && inst.Status == "LIVE" {
+				alreadyTracked = true
+				break
+			}
+		}
+
+		if !alreadyTracked {
+			var newID string
+			if app.IsLocal {
+				lhCount++
+				newID = fmt.Sprintf("LH%02d", lhCount)
+			} else {
+				opCount++
+				newID = fmt.Sprintf("OP%02d", opCount)
+			}
+
+			defaultName := fmt.Sprintf("%s_%d", app.Name, app.Port)
+
+			cfg.Instances[newID] = config.Instance{
+				ID:           newID,
+				Name:         defaultName,
+				Path:         app.Path,
+				StartCommand: "External Process",
+				TargetPort:   app.Port,
+				Status:       "LIVE",
+				LastPID:      app.PID,
+			}
+			needsSave = true
+		}
+	}
+
+	if needsSave {
+		_ = config.SaveConfig(cfg)
+	}
+	// --- END RADAR SEQUENCE ---
+
 	ti := textinput.New()
-	ti.Placeholder = "Type 'clear', 'stop LH01', etc..."
+	ti.Placeholder = "Type 'nchange OP01 NewName', 'logs LH01', 'clear'..."
 	ti.Prompt = "PLAN-B > "
 	ti.PromptStyle = promptStyle
 	ti.Focus()
@@ -75,7 +130,7 @@ func InitialModel() model {
 		ramUsed:   ram,
 		instances: cfg.Instances,
 		input:     ti,
-		history:   []logLine{},
+		history:   []logLine{{text: "System Boot: Global Radar Scan Complete.", isErr: false, isCmd: false}},
 	}
 }
 
@@ -162,6 +217,60 @@ func (m *model) processCommand(inputStr string) {
 		m.history = []logLine{} // Instantly wipe the terminal history
 		return
 
+	// --- NEW FEATURE: NCHANGE COMMAND ---
+	case "nchange":
+		if len(parts) < 3 {
+			m.addLog("Usage: nchange [ID] [NewName]", true, false)
+			return
+		}
+		targetID := strings.ToUpper(parts[1])
+		newName := parts[2]
+
+		cfg, _ := config.LoadConfig()
+		inst, exists := cfg.Instances[targetID]
+		if !exists {
+			m.addLog(fmt.Sprintf("Error: No instance found with ID '%s'", targetID), true, false)
+			return
+		}
+
+		inst.Name = newName
+		cfg.Instances[targetID] = inst
+		_ = config.SaveConfig(cfg)
+
+		m.addLog(fmt.Sprintf("Successfully renamed %s to '%s'", targetID, newName), false, false)
+
+	case "logs":
+		if len(parts) < 2 {
+			m.addLog("Usage: logs [ID]", true, false)
+			return
+		}
+		targetID := strings.ToUpper(parts[1])
+
+		homeDir, _ := os.UserHomeDir()
+		logPath := filepath.Join(homeDir, ".planb", "logs", fmt.Sprintf("%s_stdout.log", targetID))
+
+		content, err := os.ReadFile(logPath)
+		if err != nil {
+			m.addLog(fmt.Sprintf("No logs found for %s", targetID), true, false)
+			return
+		}
+
+		// Grab the last few lines so it doesn't flood the embedded terminal
+		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
+
+		// Print up to the last 3 lines of the log
+		startIdx := len(lines) - 3
+		if startIdx < 0 {
+			startIdx = 0
+		}
+
+		m.addLog(fmt.Sprintf("--- Last logs for %s ---", targetID), false, false)
+		for i := startIdx; i < len(lines); i++ {
+			if lines[i] != "" {
+				m.addLog(lines[i], false, false)
+			}
+		}
+
 	case "stop":
 		if len(parts) < 2 {
 			m.addLog("Usage: stop [ID]", true, false)
@@ -242,8 +351,8 @@ func (m model) View() string {
 
 	systemState := textStyle.Render(
 		fmt.Sprintf("[SYSTEM STATE]\n"+
-			"Core Engine: Active (Live)   | Active Instances: %-5d | Ports Bound: 0\n"+
-			"Host CPU   : %-14s  | Host Memory     : %-14s\n", activeCount, m.cpuLoad, m.ramUsed),
+			"Core Engine: Active (Live)   | Active Instances: %-5d | Ports Bound: %-5d\n"+
+			"Host CPU   : %-14s  | Host Memory     : %-14s\n", activeCount, activeCount, m.cpuLoad, m.ramUsed),
 	)
 	systemBox := baseStyle.Render(systemState)
 
@@ -255,13 +364,21 @@ func (m model) View() string {
 	if len(m.instances) == 0 {
 		rows = append(rows, textStyle.Render("No instances registered. Use the terminal below to start one."))
 	} else {
-		var keys []string
+		// --- NEW FEATURE: SORTING OP FIRST, THEN LH ---
+		var opKeys []string
+		var lhKeys []string
 		for k := range m.instances {
-			keys = append(keys, k)
+			if strings.HasPrefix(k, "OP") {
+				opKeys = append(opKeys, k)
+			} else {
+				lhKeys = append(lhKeys, k)
+			}
 		}
-		sort.Strings(keys)
+		sort.Strings(opKeys)
+		sort.Strings(lhKeys)
+		allKeys := append(opKeys, lhKeys...)
 
-		for _, id := range keys {
+		for _, id := range allKeys {
 			inst := m.instances[id]
 			stateStr := fmt.Sprintf("[%s]", inst.Status)
 			portStr := fmt.Sprintf("%d", inst.TargetPort)
@@ -274,11 +391,16 @@ func (m model) View() string {
 			}
 			runtime := "Custom"
 			cmdLower := strings.ToLower(inst.StartCommand)
-			if strings.Contains(cmdLower, "python") {
+			nameLower := strings.ToLower(inst.Name)
+
+			if strings.Contains(cmdLower, "python") || strings.Contains(nameLower, "python") {
 				runtime = "Python"
-			} else if strings.Contains(cmdLower, "node") {
+			} else if strings.Contains(cmdLower, "node") || strings.Contains(nameLower, "node") {
 				runtime = "Node.js"
+			} else if inst.StartCommand == "External Process" {
+				runtime = "System"
 			}
+
 			row := textStyle.Render(fmt.Sprintf("%-6s | %-18s | %-8s | %-6s | %-8s | %-30s",
 				id, inst.Name, stateStr, portStr, runtime, path))
 			rows = append(rows, row)
