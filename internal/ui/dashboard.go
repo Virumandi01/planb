@@ -511,19 +511,43 @@ func (m model) View() string {
 			historyLines += successStyle.Render(">> "+msg.text) + "\n"
 		}
 	}
-
-	terminalTitle := "[EMBEDDED TERMINAL]"
+	// --- NEW BORDER-INTEGRATED HEADER ---
+	terminalTitle := "╭──── TERMINAL ─"
 	if m.focusedPanel == "terminal" {
-		terminalTitle = "[EMBEDDED TERMINAL] ● ACTIVE INPUT MODE"
+		terminalTitle = "╭──── Terminal ──"
 	}
-	inputArea := terminalTitle + "\n" + historyLines + m.input.View()
 
-	// Dynamic border rendering for the terminal
+	// FIX: Set total target width to 89 (87 inner width + 2 borders)
+	targetTotalWidth := 89
+	// Subtract the title length AND the 1 closing "╮" character
+	fillCount := targetTotalWidth - len([]rune(terminalTitle)) - 1
+	if fillCount < 0 {
+		fillCount = 0
+	}
+	topLine := terminalTitle + strings.Repeat("─", fillCount) + "╮"
+
+	if m.focusedPanel == "terminal" {
+		topLine = lipgloss.NewStyle().Foreground(lipgloss.Color("69")).Render(topLine)
+	} else {
+		topLine = lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(topLine)
+	}
+
+	inputArea := historyLines + m.input.View()
+
+	// Bottom box uses 87 inner width (which + 2 borders equals 89 total)
 	var finalInputBox string
 	if m.focusedPanel == "terminal" {
-		finalInputBox = focusedStyle.Render(inputArea)
+		finalInputBox = topLine + "\n" + lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, true, true, true).
+			BorderForeground(lipgloss.Color("69")).
+			Width(87).
+			Render(inputArea)
 	} else {
-		finalInputBox = baseStyle.Render(inputArea)
+		finalInputBox = topLine + "\n" + lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, true, true, true).
+			BorderForeground(lipgloss.Color("240")).
+			Width(87).
+			Render(inputArea)
 	}
 
 	footer := textStyle.Render("Controls: [Tab] Switch Panels | [Esc/Ctrl+C] Exit back to OS terminal.")
