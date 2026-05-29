@@ -60,6 +60,7 @@ type model struct {
 	focusedPanel string // "terminal" or "table"
 	cursor       int    // Which row is highlighted in the table
 	scrollOffset int    // Viewport window tracking pointer
+	currentView  string // Will be "main" or "settings"
 }
 
 type tickMsg time.Time
@@ -141,6 +142,9 @@ func InitialModel() model {
 		focusedPanel: "terminal", // Boot directly focused into the terminal prompt
 		cursor:       0,
 		scrollOffset: 0,
+
+		// added line any error , delete it
+		currentView: "main",
 	}
 }
 
@@ -290,6 +294,18 @@ func (m *model) processCommand(inputStr string) {
 		m.addLog(fmt.Sprintf("Path: %s", inst.Path), false, false)
 		m.addLog(fmt.Sprintf("Cmd:  %s", inst.StartCommand), false, false)
 
+	case "settings":
+		m.currentView = "settings"
+		m.addLog("Switched to Settings Matrix.", false, false)
+		return
+
+	case "home", "back", "exit":
+		if m.currentView == "settings" {
+			m.currentView = "main"
+			m.addLog("Returned to Main Dashboard.", false, false)
+			return
+		}
+
 	case "logs":
 		if len(parts) < 2 {
 			m.addLog("Usage: logs [ID]", true, false)
@@ -385,8 +401,7 @@ func (m *model) processCommand(inputStr string) {
 		m.addLog(fmt.Sprintf("Unknown command: %s", action), true, false)
 	}
 }
-
-func (m model) View() string {
+func (m model) MainView() string {
 	header := titleStyle.Render("PLAN-B MANAGEMENT SYSTEM | Planet VE v0.1")
 
 	activeCount := 0
@@ -554,4 +569,92 @@ func (m model) View() string {
 	footerBox := baseStyle.Render(footer)
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, systemBox, finalTableBox, finalInputBox, footerBox)
+}
+
+// This is the Router. It decides which screen to draw!
+func (m model) View() string {
+	if m.currentView == "settings" {
+		return m.SettingsView()
+	}
+	return m.MainView()
+}
+
+// This draws the new Settings Page
+func (m model) SettingsView() string {
+	header := titleStyle.Render("PLAN-B MANAGEMENT SYSTEM | Settings & Configuration")
+
+	// Load current settings to display them
+	s, _ := config.LoadSettings()
+
+	// 1. Permissions & Background Processes Box
+	healthStatus := "OFF (Manual Only)"
+	if s.AutoHealthCheck {
+		healthStatus = "ON (Active Ram Usage)"
+	}
+
+	bgText := textStyle.Render(
+		"[BACKGROUND PROCESSES & PERMISSIONS]\n" +
+			fmt.Sprintf("Auto-Health Checker  : %s\n", healthStatus) +
+			fmt.Sprintf("Cloudflare Tunnel ID : %s\n", s.CloudflareTunnelID),
+	)
+	bgBox := baseStyle.Render(bgText)
+
+	// 2. Core Directories & Files Box
+	dirText := textStyle.Render(
+		"[CORE DIRECTORIES & LOGGING PATHS]\n" +
+			fmt.Sprintf("Logs Directory       : %s\n", s.LogsLocation) +
+			fmt.Sprintf("Error Book Location  : %s\n", s.ErrorLogsLocation) +
+			fmt.Sprintf("Host Book Location   : %s\n", s.HostBookLocation),
+	)
+	dirBox := baseStyle.Render(dirText)
+
+	// 3. Command Reference / Help Box
+	helpText := textStyle.Render(
+		"[COMMAND REFERENCE MANUAL]\n" +
+			"start [Name] [Cmd] : Launch a new background ghost process.\n" +
+			"stop [ID]          : Gracefully terminate a process.\n" +
+			"info [ID]          : View detailed path and execution data.\n" +
+			"logs [ID]          : Print the last execution output logs.\n" +
+			"nchange [ID] [Name]: Rename a tracked process.\n" +
+			"home / back        : Return to the main instance dashboard.",
+	)
+	helpBox := baseStyle.Render(helpText)
+
+	// Group the settings boxes together
+	settingsArea := lipgloss.JoinVertical(lipgloss.Left, bgBox, dirBox, helpBox)
+
+	// The Embedded Terminal (Reused from your main view!)
+	terminalTitle := "╭──── TERMINAL ──● SETTINGS OVERRIDE ─"
+	targetTotalWidth := 89
+	fillCount := targetTotalWidth - len([]rune(terminalTitle)) - 1
+	if fillCount < 0 {
+		fillCount = 0
+	}
+	topLine := terminalTitle + strings.Repeat("─", fillCount) + "╮"
+	topLine = lipgloss.NewStyle().Foreground(lipgloss.Color("69")).Render(topLine)
+
+	historyLines := ""
+	emptyLinesNeeded := 4 - len(m.history)
+	for i := 0; i < emptyLinesNeeded; i++ {
+		historyLines += "\n"
+	}
+	for _, msg := range m.history {
+		if msg.isCmd {
+			historyLines += echoStyle.Render("PLAN-B > "+msg.text) + "\n"
+		} else if msg.isErr {
+			historyLines += errorStyle.Render(">> "+msg.text) + "\n"
+		} else {
+			historyLines += successStyle.Render(">> "+msg.text) + "\n"
+		}
+	}
+
+	finalInputBox := topLine + "\n" + lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), false, true, true, true).
+		BorderForeground(lipgloss.Color("69")).Width(87).Render(historyLines+m.input.View())
+
+	footer := textStyle.Render("Controls: Type 'home' to return | [Esc/Ctrl+C] Exit.")
+	footerBox := baseStyle.Render(footer)
+
+	// Stack the whole page vertically
+	return lipgloss.JoinVertical(lipgloss.Left, header, settingsArea, finalInputBox, footerBox)
 }
